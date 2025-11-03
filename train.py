@@ -29,8 +29,10 @@ def build_model(input_size, num_classes):
     model = nn.Sequential(
         nn.Linear(input_size, 64),
         nn.ReLU(),
+        nn.Dropout(0.3),
         nn.Linear(64, 128),
         nn.ReLU(),
+        nn.Dropout(0.3),
         nn.Linear(128, num_classes)
     )
     return model
@@ -38,11 +40,11 @@ def build_model(input_size, num_classes):
 num_classes = len(set(y))
 model = build_model(x_train.shape[1], num_classes)
 loss_fn = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.AdamW(model.parameters(), lr=0.001)
 print(model)
 
 # Train model
-epochs = 1000
+epochs = 3000
 for epoch in range(epochs):
     model.train()
     y_pred = model(x_train)
