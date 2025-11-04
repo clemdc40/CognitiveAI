@@ -1,0 +1,15 @@
+{
+  "features": [
+    "Age",
+    "Gender",
+    "BMI",
+    "Smoking",
+    "AlcoholConsumption",
+    "PhysicalActivity",
+    "SleepQuality",
+    "FamilyHistoryAlzheimers",
+    "MMSE",
+    "FunctionalAssessment",
+    "ADL"
+  ]
+}

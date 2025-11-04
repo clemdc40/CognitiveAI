@@ -1,74 +1,91 @@
-#["Age", "Gender", "BMI", "Smoking", "AlcoholConsumption", "PhysicalActivity", "SleepQuality", "FamilyHistoryAlzheimers", "MMSE", "FunctionalAssessment", "ADL", "Diagnosis"]
+# train.py
+# Entraîne le MLP, imprime l'accuracy, et sauvegarde :
+# - Cognitive_1.pth (poids du modèle)
+# - scaler.pkl (StandardScaler)
+# - features.json (ordre exact des features)
 
+import json
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from joblib import dump
 
-# Load dataset
-data = pd.read_csv('alzheimers_disease_data.csv')
+DATA_PATH = "alzheimers_disease_data.csv"
+MODEL_PATH = "Cognitive_1.pth"
+SCALER_PATH = "scaler.pkl"
+FEATURES_PATH = "features.json"
 
-# Preprocess dataset
-x_scaled = data[["Age", "Gender", "BMI", "Smoking", "AlcoholConsumption", "PhysicalActivity", "SleepQuality", "FamilyHistoryAlzheimers", "MMSE", "FunctionalAssessment", "ADL"]].values
-y = data["Diagnosis"].values
+# 1) Chargement
+data = pd.read_csv(DATA_PATH)
 
+# 2) Préparation
+features = ["Age","Gender","BMI","Smoking","AlcoholConsumption","PhysicalActivity",
+            "SleepQuality","FamilyHistoryAlzheimers","MMSE","FunctionalAssessment","ADL"]
+X = data[features].values.astype(np.float32)
+y = data["Diagnosis"].values.astype(np.int64)
+
+# 3) Normalisation (fit sur train uniquement)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 scaler = StandardScaler()
-x_scaled = scaler.fit_transform(x_scaled)
-x = torch.tensor(x_scaled, dtype=torch.float32)
-print(f"Features shape: {x.shape}, Labels shape: {y.shape}")
+X_tr = scaler.fit_transform(X_tr).astype(np.float32)
+X_te = scaler.transform(X_te).astype(np.float32)
 
-# Split dataset
-x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42)
-y_train = torch.tensor(y_train, dtype=torch.long)
-y_test = torch.tensor(y_test, dtype=torch.long)
+# 4) Conversion en tenseurs
+x_train = torch.tensor(X_tr, dtype=torch.float32)
+y_train = torch.tensor(y_tr, dtype=torch.long)
+x_test  = torch.tensor(X_te, dtype=torch.float32)
+y_test  = torch.tensor(y_te, dtype=torch.long)
 
-# Define model
-def build_model(input_size, num_classes):
-    model = nn.Sequential(
-        nn.Linear(input_size, 64),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(64, 128),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(128, num_classes)
-    )
-    return model
+# 5) Modèle
+class MLP(nn.Module):
+    def __init__(self, input_dim, num_classes=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+    def forward(self, x):
+        return self.net(x)
 
-num_classes = len(set(y))
-model = build_model(x_train.shape[1], num_classes)
+model = MLP(input_dim=x_train.shape[1], num_classes=2)
 loss_fn = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=0.001)
-print(model)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3)
 
-# Train model
-epochs = 3000
+# 6) Entraînement
+epochs = 1200
 for epoch in range(epochs):
     model.train()
     y_pred = model(x_train)
     loss = loss_fn(y_pred, y_train)
-    
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    
-    if (epoch+1) % 100 == 0:
-        print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
 
-# Evaluate model
+    if (epoch+1) % 100 == 0:
+        print(f"Epoch [{epoch+1}/{epochs}] - loss={loss.item():.4f}")
+
+# 7) Évaluation
 model.eval()
 with torch.no_grad():
-    y_pred = model(x_test)
-    _, predicted = torch.max(y_pred, 1)
-    accuracy = (predicted == y_test).float().mean()
-    print(f'Accuracy: {accuracy.item():.4f}')
+    logits = model(x_test)
+    pred = logits.argmax(dim=1)
+    acc = (pred == y_test).float().mean().item()
+print(f"Test accuracy: {acc:.4f}")
 
+# 8) Sauvegardes
+torch.save(model.state_dict(), MODEL_PATH)
+dump(scaler, SCALER_PATH)
+with open(FEATURES_PATH, "w", encoding="utf-8") as f:
+    json.dump({"features": features}, f, ensure_ascii=False, indent=2)
 
-# test du modèle avec un échantillon
-sample = torch.tensor([[70, 1, 25.0, 0, 1, 3, 4, 1, 28, 10, 5]], dtype=torch.float32)
-with torch.no_grad():
-    logits = model(sample)
-    predicted_class = torch.argmax(torch.softmax(logits, dim=1))
-print(f"Predicted class index for sample: {predicted_class.item()}")
+print(f"Artifacts saved: {MODEL_PATH}, {SCALER_PATH}, {FEATURES_PATH}")

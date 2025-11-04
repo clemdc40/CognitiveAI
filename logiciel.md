@@ -87,3 +87,16 @@ Predicted class index for sample: 0
 ```
 
 Evolution de l'efficacité en passant de 72% à 78%.
+
+## Objectif de test
+Ce site web avec Streamlit a été développé dans un but de test et de démonstration uniquement. Il permet de :
+
+1. **Tester l'interface utilisateur** : Évaluer l'ergonomie et la facilité d'utilisation de l'interface pour la saisie des données patient.
+2. **Valider le modèle** : Vérifier le bon fonctionnement du modèle d'IA en conditions réelles avec différentes entrées.
+3. **Démonstration conceptuelle** : Illustrer comment une IA pourrait potentiellement assister dans l'évaluation préliminaire des risques d'Alzheimer.
+
+ **Avertissement important** :
+- Cette application est strictement à des fins de test et de démonstration
+- Les prédictions ne doivent en aucun cas être utilisées pour des diagnostics médicaux
+- Les données utilisées pour l'entraînement sont synthétiques et ne reflètent pas des cas réels
+- Ce prototype servira de base pour développer une solution plus robuste et médicalement validée dans le futur
