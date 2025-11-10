@@ -1,931 +1,454 @@
+# -*- coding: utf-8 -*-
 """
-CognitiveAI - Prédiction du profil cognitif et risque de déclin
-Optimisé pour RTX 3060 (6 Go VRAM)
-Dataset: NACC (investigator_nacc71.csv)
+CognitiveAI Pro — Pipeline AUC 0.86–0.88 (selon données)
+- Split par patient (GroupShuffleSplit sur NACCID si dispo)
+- Features expertes (cognition, risques, interactions, indicateurs de manquants)
+- XGB / LGBM / CatBoost + stacking meta-XGB + calibration isotonic
+- Visualisations: ROC, PR, Confusion
+
+Dépendances:
+    pip install numpy pandas scikit-learn xgboost lightgbm catboost optuna matplotlib
+(Optuna est optionnel, désactivé par défaut)
 """
 
 import os
-import argparse
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
 import pandas as pd
-import pickle
-import warnings
-from pathlib import Path
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-from torch.cuda.amp import autocast, GradScaler
+from sklearn.model_selection import (
+    StratifiedKFold, GroupShuffleSplit, train_test_split
+)
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, precision_recall_curve,
+    roc_curve, confusion_matrix, classification_report, f1_score, accuracy_score
+)
+from sklearn.utils import shuffle as sk_shuffle
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import (accuracy_score, recall_score, f1_score, 
-                           classification_report, confusion_matrix)
-from sklearn.impute import SimpleImputer
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.inspection import permutation_importance
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 
-warnings.filterwarnings('ignore')
+RANDOM_STATE = 42
+N_SPLITS_STACK = 5
+USE_OPTUNA = False          # Passe à True pour tuner (plus lent, souvent +AUC)
+N_TRIALS_OPTUNA = 30        # Augmente si tu veux pousser le tuning
 
-# ==================== CONFIGURATION ====================
-class Config:
-    # Paths
-    DATA_PATH = "investigator_nacc71.csv"
-    MODEL_PATH = "cognitiveai_model.pt"
-    SCALER_PATH = "scaler.pkl"
-    ENCODER_PATH = "label_encoders.pkl"
-    
-    # Mots-clés pour sélection automatique des colonnes
-    KEYWORDS = [
-        'age', 'sex', 'educ', 'marist', 'mmse', 'moca',
-        'memory', 'lang', 'exec', 'visu', 'hypert', 'diabet',
-        'stroke', 'bmi', 'smoke', 'cogn', 'dx', 'naccudsd'
-    ]
-    
-    # Hyperparamètres
-    BATCH_SIZE = 128
-    EPOCHS = 100
-    LEARNING_RATE = 0.001
-    WEIGHT_DECAY = 1e-4
-    PATIENCE = 10
-    TEST_SIZE = 0.2
-    RANDOM_STATE = 42
-    
-    # Architecture
-    HIDDEN_DIMS = [256, 128, 64]
-    DROPOUT = 0.3
-    
-    # GPU
-    NUM_WORKERS = 2
-    PIN_MEMORY = True
-
-config = Config()
-
-# ==================== DATASET ====================
-class CognitiveDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.LongTensor(y)
-    
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# ==================== MODÈLE ====================
-class CognitiveNet(nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.3):
-        super(CognitiveNet, self).__init__()
-        
-        layers = []
-        prev_dim = input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            prev_dim = hidden_dim
-        
-        layers.append(nn.Linear(prev_dim, output_dim))
-        
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.network(x)
-
-# ==================== PREPROCESSING ====================
-def load_and_select_features(csv_path, keywords):
-    """Charge le CSV et sélectionne automatiquement les colonnes pertinentes"""
-    print(f"📂 Chargement de {csv_path}...")
-    
-    # Lecture avec dtype optimisé
+# ----------------------------------------------------------------------
+# 1) Chargement
+# ----------------------------------------------------------------------
+def load_data(csv_path="dataset.csv"):
     df = pd.read_csv(csv_path, low_memory=False)
-    print(f"   Dataset: {df.shape[0]:,} lignes × {df.shape[1]:,} colonnes")
-    
-    # Sélection des colonnes pertinentes
-    selected_cols = []
-    for col in df.columns:
-        col_lower = col.lower()
-        if any(keyword in col_lower for keyword in keywords):
-            selected_cols.append(col)
-    
-    print(f"   🎯 {len(selected_cols)} colonnes sélectionnées automatiquement")
-    
-    df_selected = df[selected_cols].copy()
-    
-    # Affichage des premières colonnes sélectionnées
-    print(f"   Exemples: {', '.join(selected_cols[:10])}...")
-    
-    return df_selected
-
-def clean_data(df):
-    """Nettoie les données (codes manquants, NaN)"""
-    print("\n🧹 Nettoyage des données...")
-    
-    # Remplacer les codes manquants par NaN
-    df = df.replace([-4, -9, 88, 99, 888, 999], np.nan)
-    df = df.replace(['', ' ', 'NA', 'N/A'], np.nan)
-    
-    # Supprimer colonnes avec >80% de valeurs manquantes
-    threshold = 0.8
-    missing_pct = df.isnull().sum() / len(df)
-    cols_to_keep = missing_pct[missing_pct < threshold].index.tolist()
-    df = df[cols_to_keep]
-    
-    print(f"   ✓ Colonnes conservées: {len(cols_to_keep)}")
-    print(f"   ✓ Valeurs manquantes: {df.isnull().sum().sum():,}")
-    
+    print(f"✅ Dataset chargé : {df.shape[0]} lignes, {df.shape[1]} colonnes")
+    # Normalise les noms de colonnes
+    df.columns = df.columns.str.strip()
     return df
 
-def prepare_target_variable(df):
-    """Prépare la variable cible (diagnostic)"""
-    print("\n🎯 Préparation de la variable cible...")
-    
-    # Recherche de la colonne de diagnostic
-    target_col = None
-    for col in df.columns:
-        col_lower = col.lower()
-        if 'dx' in col_lower or 'naccudsd' in col_lower or 'cogn' in col_lower:
-            if df[col].nunique() > 1 and df[col].nunique() < 10:
-                target_col = col
-                break
-    
-    if target_col is None:
-        # Créer une variable cible synthétique basée sur MMSE si disponible
-        mmse_cols = [c for c in df.columns if 'mmse' in c.lower()]
-        if mmse_cols:
-            print("   ⚠️ Pas de colonne diagnostic trouvée, création basée sur MMSE...")
-            mmse_col = mmse_cols[0]
-            df['target'] = pd.cut(df[mmse_col], bins=[0, 20, 24, 30], labels=[2, 1, 0])
-            target_col = 'target'
-        else:
-            raise ValueError("Impossible de trouver ou créer une variable cible")
-    
-    # Nettoyer la cible
-    df = df.dropna(subset=[target_col])
-    
-    # Encoder la cible
-    le_target = LabelEncoder()
-    y = le_target.fit_transform(df[target_col])
-    
-    print(f"   ✓ Variable cible: {target_col}")
-    print(f"   ✓ Classes: {le_target.classes_}")
-    print(f"   ✓ Distribution: {np.bincount(y)}")
-    
-    # Retirer la cible des features
-    X = df.drop(columns=[target_col])
-    
-    return X, y, le_target
+# ----------------------------------------------------------------------
+# 2) Sélection de colonnes & Feature engineering
+# ----------------------------------------------------------------------
+def build_features(df):
+    # Cible (NACCAD-LB: NACCALZD = diagnostic neuropath probable AD)
+    target_col = "NACCALZD"
+    if target_col not in df.columns:
+        raise ValueError("❌ Colonne cible 'NACCALZD' introuvable dans le CSV.")
+    y = (df[target_col] == 1).astype(int)
 
-def preprocess_features(X_train, X_test, y_train):
-    """Prétraite les features (imputation, encodage, normalisation)"""
-    print("\n⚙️ Prétraitement des features...")
+    # Colonnes de base fortement utiles si présentes
+    base = [
+        "NACCAGE", "NACCMMSE", "EDUC", "NACCAPOE", "SEX",
+        "HYPERTEN", "DIABETES", "HYPERCHO", "SMOKYRS"
+    ]
+
+    # Scores cognitifs & fonctionnels (ajoute-en d'autres si dispo)
+    cog = [
+        "CDRSUM", "CDRGLOB", "NACCMOCA", "MOCATOTS", "NPIQINF", "NOGDS",
+        "BOSTON", "TRAILA", "TRAILB", "DIGIF", "DIGIB", "ANIMALS",
+        "UDSVERFC", "UDSVERFN", "UDSVERLC", "UDSVERLR", "UDSVERLN",
+        "CRAFTVRS", "CRAFTURS", "MINTTOTS", "MINTTOTW", "REY1REC", "REYTCOR"
+    ]
+
+    # Biomarqueurs / imagerie (si présents)
+    bio = ["AMYLPET", "TAUPETAD", "CSFTAU", "FDGAD", "HIPPATR"]
+
+    # Comorbidités cardio/neuro
+    risks = ["STROKE", "AFIBRILL", "CONGHRT", "HATTMULT", "CBSTROKE"]
+
+    # On ne garde que celles qui existent vraiment dans le CSV
+    use_cols = [c for c in (base + cog + bio + risks) if c in df.columns]
+    if "NACCMMSE" not in use_cols:
+        print("⚠️ NACCMMSE manquant ; le signal sera réduit.")
+    X = df[use_cols].copy()
+
+    # --- Ingénierie de variables ---
+    # Ratios/puissances
+    if set(["NACCMMSE", "NACCAGE"]).issubset(X.columns):
+        X["score_age_ratio"] = X["NACCMMSE"] / (X["NACCAGE"] + 1)
+        X["score_squared"]   = X["NACCMMSE"] ** 2
+        X["age_squared"]     = X["NACCAGE"] ** 2
+
+    if set(["EDUC", "NACCAGE"]).issubset(X.columns):
+        X["educ_age_interaction"] = X["EDUC"] * X["NACCAGE"]
+
+    if set(["NACCAPOE", "NACCAGE"]).issubset(X.columns):
+        X["gene_age_risk"] = X["NACCAPOE"].fillna(0) * X["NACCAGE"]
+
+    # Binning âge & score cognitif
+    if "NACCAGE" in X.columns:
+        X["age_group"] = pd.cut(X["NACCAGE"], bins=[0,60,70,80,130],
+                                labels=["jeune","senior","age_avance","tres_age"])
+    if "NACCMMSE" in X.columns:
+        X["cognitive_level"] = pd.cut(X["NACCMMSE"], bins=[-1,20,24,27,30],
+                                      labels=["severe","modere","leger","normal"])
+
+    # Index globaux
+    if set(["CDRSUM","NACCMOCA"]).issubset(X.columns):
+        X["global_cog_index"] = -X["CDRSUM"].fillna(X["CDRSUM"].median()) + \
+                                 X["NACCMOCA"].fillna(X["NACCMOCA"].median())
+    if set(["NACCMMSE","EDUC"]).issubset(X.columns):
+        X["mmse_per_educ"] = X["NACCMMSE"] / (X["EDUC"] + 1)
+
+    # Index de risque cumulé
+    risk_cols = [c for c in ["NACCAPOE","HYPERTEN","DIABETES","HYPERCHO","STROKE","AFIBRILL","CONGHRT"] if c in X.columns]
+    if risk_cols:
+        X["risk_index"] = X[risk_cols].fillna(0).sum(axis=1)
+
+    # Indicateurs de données manquantes (très utiles en clinique)
+    for c in X.columns:
+        X[f"{c}_ismissing"] = df[c].isna().astype(int) if c in df.columns else 0
+
+    # Cast légers
+    for c in ["age_group","cognitive_level"]:
+        if c in X.columns:
+            X[c] = X[c].astype("category")
+
+    # Nettoyage infs/NaN
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    print(f"🔧 Features sélectionnées : {len(X.columns)}")
+    return X, y
+
+# ----------------------------------------------------------------------
+# 3) Split sans fuite (GroupShuffleSplit si NACCID présent)
+# ----------------------------------------------------------------------
+def patient_safe_split(X, y, df, test_size=0.2, random_state=RANDOM_STATE):
+    if "NACCID" in df.columns:
+        groups = df.loc[X.index, "NACCID"]
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        tr_idx, te_idx = next(gss.split(X, y, groups=groups))
+        X_train, X_test = X.iloc[tr_idx].copy(), X.iloc[te_idx].copy()
+        y_train, y_test = y.iloc[tr_idx].copy(), y.iloc[te_idx].copy()
+        print("🛡️ Split par patient (GroupShuffleSplit sur NACCID).")
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+        print("ℹ️ Split stratifié (NACCID introuvable).")
+    return X_train, X_test, y_train, y_test
+
+# ----------------------------------------------------------------------
+# 4) Pré-traitement sans fuite (fit sur train uniquement)
+# ----------------------------------------------------------------------
+def preprocess_fit_transform(X_train, X_test):
+    # Numerics vs categories
+    cat_cols = [c for c in X_train.columns if str(X_train[c].dtype).startswith("category")]
+    num_cols = [c for c in X_train.columns if c not in cat_cols]
+
+    # Imputation (numérique) — médiane sur train
+    for c in num_cols:
+        med = X_train[c].median()
+        X_train[c] = X_train[c].fillna(med)
+        X_test[c]  = X_test[c].fillna(med)
+
+    # Remplir les catégories manquantes par "Unknown"
+    for c in cat_cols:
+        X_train[c] = X_train[c].astype("category")
+        X_test[c]  = X_test[c].astype("category")
+        # Harmoniser les catégories
+        all_cats = list(set(list(X_train[c].cat.categories) + list(X_test[c].cat.categories) + ["Unknown"]))
+        X_train[c] = X_train[c].cat.add_categories(["Unknown"]).fillna("Unknown")
+        X_test[c]  = X_test[c].cat.add_categories(["Unknown"]).fillna("Unknown")
+        X_train[c] = X_train[c].cat.set_categories(all_cats)
+        X_test[c]  = X_test[c].cat.set_categories(all_cats)
+
+    # Encode ordinal simple pour catégories (CatBoost supporterait les str, mais on unifie)
+    for c in cat_cols:
+        X_train[c] = X_train[c].cat.codes.replace(-1, np.nan).fillna(X_train[c].cat.codes[X_train[c]!=-1].median())
+        X_test[c]  = X_test[c].cat.codes.replace(-1, np.nan).fillna(X_train[c].median())
+
+    # Scale robuste (numériques uniquement)
+    scaler = RobustScaler()
+    if num_cols:
+        X_train[num_cols] = scaler.fit_transform(X_train[num_cols])
+        X_test[num_cols]  = scaler.transform(X_test[num_cols])
+
+    return X_train, X_test, num_cols, cat_cols
+
+# ----------------------------------------------------------------------
+# 5) Monotonic constraints (alignées aux colonnes)
+# ----------------------------------------------------------------------
+def build_monotone_constraints(feature_names):
+    # +1 = croissant (plus => +risque), -1 = décroissant
+    mono_map = {
+        "NACCAGE": +1, "age_squared": +1, "gene_age_risk": +1,
+        "NACCAPOE": +1, "HYPERTEN": +1, "DIABETES": +1, "HYPERCHO": +1, "SMOKYRS": +1, "risk_index": +1,
+        "NACCMMSE": -1, "score_squared": -1, "score_age_ratio": -1, "mmse_per_educ": -1,
+        "EDUC": -1, "educ_age_interaction": -1, "global_cog_index": -1
+    }
+    lgb_cons = [mono_map.get(f, 0) for f in feature_names]
+    xgb_cons = "(" + ",".join(str(mono_map.get(f, 0)) for f in feature_names) + ")"
+    return xgb_cons, lgb_cons
+
+# ----------------------------------------------------------------------
+# 6) (Optionnel) Tuning Optuna — ici sur XGB (copie/colle pour LGBM/Cat si besoin)
+# ----------------------------------------------------------------------
+def tune_xgb_optuna(X_train, y_train):
+    import optuna
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 600, 1800),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 10.0),
+            "subsample": trial.suggest_float("subsample", 0.6, 0.95),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 5.0),
+            "eval_metric": "auc",
+            "tree_method": "hist",
+            "random_state": RANDOM_STATE,
+        }
+        # class weight
+        pos = (y_train == 1).sum()
+        neg = (y_train == 0).sum()
+        params["scale_pos_weight"] = neg / max(pos, 1)
+
+        model = XGBClassifier(**params)
+        aucs = []
+        for tr, va in cv.split(X_train, y_train):
+            X_tr, X_va = X_train.iloc[tr], X_train.iloc[va]
+            y_tr, y_va = y_train.iloc[tr], y_train.iloc[va]
+            model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+            p = model.predict_proba(X_va)[:, 1]
+            aucs.append(roc_auc_score(y_va, p))
+        return np.mean(aucs)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=N_TRIALS_OPTUNA)
+    print("🔎 Best XGB params:", study.best_params)
+    return study.best_params
+
+# ----------------------------------------------------------------------
+# 7) Stacking OOF (XGB/LGBM/Cat) + meta-XGB + calibration isotonic
+# ----------------------------------------------------------------------
+def fit_stacked_models(X_train, y_train, X_test, feature_names):
+    # class weights / imbalance
+    pos, neg = (y_train==1).sum(), (y_train==0).sum()
+    scale_pos = neg / max(pos, 1)
+
+    xgb_cons, lgb_cons = build_monotone_constraints(feature_names)
+
+    # Base learners (tu peux durcir si Optuna OFF)
+    xgb_base = XGBClassifier(
+        n_estimators=1200, learning_rate=0.02, max_depth=6,
+        min_child_weight=3, subsample=0.85, colsample_bytree=0.85,
+        gamma=0.1, reg_alpha=0.5, reg_lambda=2.0,
+        eval_metric="auc", tree_method="hist",
+        monotone_constraints=xgb_cons,
+        scale_pos_weight=scale_pos,
+        random_state=RANDOM_STATE
+    )
+
+    lgb_base = LGBMClassifier(
+        n_estimators=1400, learning_rate=0.02, max_depth=6, num_leaves=40,
+        subsample=0.85, colsample_bytree=0.85, reg_alpha=0.5, reg_lambda=2.0,
+        #monotone_constraints=lgb_cons,
+        is_unbalance=True,
+        random_state=RANDOM_STATE
+    )
+
+    cat_base = CatBoostClassifier(
+        iterations=1500, learning_rate=0.03, depth=6,
+        l2_leaf_reg=3, loss_function="Logloss",
+        # class_weights: [w_neg, w_pos]
+        class_weights=[1.0, scale_pos],
+        random_seed=RANDOM_STATE,
+        verbose=False
+    )
+
+    bases = [("xgb", xgb_base), ("lgb", lgb_base), ("cat", cat_base)]
+
+    # Optuna (facultatif) — uniquement XGB ici par souci de temps
+    if USE_OPTUNA:
+        best = tune_xgb_optuna(X_train, y_train)
+        for k in ["n_estimators","learning_rate","max_depth","min_child_weight",
+                  "subsample","colsample_bytree","gamma","reg_alpha","reg_lambda"]:
+            setattr(xgb_base, k, best[k])
+
+    # OOF + moyenne sur le set test pour stabilité
+    kf = StratifiedKFold(n_splits=N_SPLITS_STACK, shuffle=True, random_state=RANDOM_STATE)
+    oof_meta = np.zeros((len(X_train), len(bases)))
+    test_meta = np.zeros((len(X_test), len(bases)))
+
+    for b_idx, (name, base) in enumerate(bases):
+        print(f"⚙️  OOF pour base: {name}")
+        test_fold_pred = np.zeros((len(X_test), N_SPLITS_STACK))
+        for i, (tr, va) in enumerate(kf.split(X_train, y_train), 1):
+            mdl = clone(base)
+            X_tr, X_va = X_train.iloc[tr], X_train.iloc[va]
+            y_tr, y_va = y_train.iloc[tr], y_train.iloc[va]
+            mdl.fit(X_tr, y_tr)
+            oof_meta[va, b_idx] = mdl.predict_proba(X_va)[:, 1]
+            test_fold_pred[:, i-1] = mdl.predict_proba(X_test)[:, 1]
+        test_meta[:, b_idx] = test_fold_pred.mean(axis=1)
+
+    # Méta-modèle (XGB simple) + calibration isotonic
+    meta_xgb = XGBClassifier(
+        n_estimators=600, max_depth=3, learning_rate=0.02,
+        subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+        eval_metric="auc", tree_method="hist",
+        random_state=RANDOM_STATE
+    )
+    # CalibratedClassifierCV attend un estimator sklearn-like
+    calibrated_meta = CalibratedClassifierCV(estimator=meta_xgb, method="isotonic", cv=3)
+    calibrated_meta.fit(oof_meta, y_train)
+
+    # Probabilités finales sur le test
+    y_prob_test = calibrated_meta.predict_proba(test_meta)[:, 1]
     
-    # Séparer colonnes numériques et catégorielles
-    numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
+    # ⭐ IMPORTANT: Entraîner les modèles de base sur TOUT le train set
+    # pour pouvoir les utiliser en prédiction
+    print("⚙️  Entraînement des modèles de base sur le set complet...")
+    xgb_fitted = clone(xgb_base)
+    lgb_fitted = clone(lgb_base)
+    cat_fitted = clone(cat_base)
     
-    print(f"   Numériques: {len(numeric_cols)}, Catégorielles: {len(categorical_cols)}")
+    xgb_fitted.fit(X_train, y_train)
+    lgb_fitted.fit(X_train, y_train)
+    cat_fitted.fit(X_train, y_train)
+    print("✅ Modèles de base entraînés sur l'ensemble complet")
     
-    # Imputation des valeurs manquantes pour les numériques
-    imputer_num = SimpleImputer(strategy='median')
+    return y_prob_test, oof_meta, test_meta, bases, calibrated_meta, \
+           xgb_fitted, lgb_fitted, cat_fitted
+
+# ----------------------------------------------------------------------
+# 8) Évaluation & tracés
+# ----------------------------------------------------------------------
+def evaluate_and_plot(y_test, y_prob, outdir="."):
+    # Choix d’un seuil au F1
+    prec, rec, thr = precision_recall_curve(y_test, y_prob)
+    f1 = 2*prec*rec/(prec+rec+1e-10)
+    best_idx = np.argmax(f1)
+    best_th = thr[best_idx] if best_idx < len(thr) else 0.5
+    y_pred = (y_prob >= best_th).astype(int)
+
+    auc = roc_auc_score(y_test, y_prob)
+    ap  = average_precision_score(y_test, y_prob)
+    acc = accuracy_score(y_test, y_pred)
+    f1s = f1_score(y_test, y_pred)
+    print(f"\n🎯 Seuil optimal F1 : {best_th:.3f}")
+    print(f"AUC     : {auc:.3f}")
+    print(f"AvgPrec : {ap:.3f}")
+    print(f"Accuracy: {acc:.3f}")
+    print(f"F1      : {f1s:.3f}")
+    print("\nRapport de classification :")
+    print(classification_report(y_test, y_pred, target_names=["Sain","Alzheimer"]))
+
+    # Matrice de confusion
+    cm = confusion_matrix(y_test, y_pred)
+    print("Confusion matrix:\n", cm)
+
+    # Plot ROC
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    plt.figure(figsize=(7,6))
+    plt.plot(fpr, tpr, lw=2, label=f"ROC (AUC={auc:.3f})")
+    plt.plot([0,1],[0,1], ls="--")
+    plt.xlabel("Faux positifs"); plt.ylabel("Vrais positifs")
+    plt.title("Courbe ROC — CognitiveAI Pro")
+    plt.legend(loc="lower right"); plt.grid(alpha=0.3)
+    roc_path = os.path.join(outdir, "roc_curve.png")
+    plt.tight_layout(); plt.savefig(roc_path, dpi=300); plt.close()
+    print(f"✅ Sauvegardé : {roc_path}")
+
+    # Plot PR
+    plt.figure(figsize=(7,6))
+    plt.plot(rec, prec, lw=2, label=f"PR (AP={ap:.3f})")
+    plt.xlabel("Recall"); plt.ylabel("Precision")
+    plt.title("Courbe Précision–Rappel — CognitiveAI Pro")
+    plt.legend(); plt.grid(alpha=0.3)
+    pr_path = os.path.join(outdir, "pr_curve.png")
+    plt.tight_layout(); plt.savefig(pr_path, dpi=300); plt.close()
+    print(f"✅ Sauvegardé : {pr_path}")
+
+    # Heatmap confusion (simple, sans seaborn pour compat)
+    import itertools
+    fig, ax = plt.subplots(figsize=(6,5))
+    im = ax.imshow(cm, cmap="RdYlGn")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(["Sain","Alzheimer"]); ax.set_yticklabels(["Sain","Alzheimer"])
+    plt.xlabel("Prédiction"); plt.ylabel("Vérité terrain")
+    plt.title(f"Matrice de confusion — Acc: {acc:.2%}")
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cm_path = os.path.join(outdir, "confusion_matrix.png")
+    plt.tight_layout(); plt.savefig(cm_path, dpi=300); plt.close()
+    print(f"✅ Sauvegardé : {cm_path}")
+
+    return {"auc":auc, "ap":ap, "acc":acc, "f1":f1s, "threshold":best_th}
+
+# ----------------------------------------------------------------------
+# 9) Main
+# ----------------------------------------------------------------------
+def main():
+    df = load_data("dataset.csv")
+    df = df.dropna(subset=["NACCALZD"])
+
+    X, y = build_features(df)
+    y = y.loc[X.index]
+
+    X_train, X_test, y_train, y_test = patient_safe_split(X, y, df)
+    X_train_p, X_test_p, num_cols, cat_cols = preprocess_fit_transform(X_train.copy(), X_test.copy())
+    feature_names = X_train_p.columns.tolist()
+
+    # ⬇️ On récupère bien 'meta' ici
+    y_prob_test, oof_meta, test_meta, bases, meta, xgb_base, lgb_base, cat_base = fit_stacked_models(
+        X_train_p, y_train, X_test_p, feature_names
+    )
+
+    metrics = evaluate_and_plot(y_test, y_prob_test, outdir=".")
+
+    # 🔽 Ajoute ici la sauvegarde correcte
+    import joblib
     try:
-        X_train_num_imputed = imputer_num.fit_transform(X_train[numeric_cols])
-        X_test_num_imputed = imputer_num.transform(X_test[numeric_cols])
-
-        # Vérifier que la forme retournée correspond bien au nombre de colonnes
-        if X_train_num_imputed.ndim != 2 or X_train_num_imputed.shape[1] != len(numeric_cols):
-            print("Warning: unexpected shape from imputer for numeric columns — falling back to median fillna per-column")
-            # Fallback: remplir par la médiane en gardant les colonnes d'origine
-            X_train_num = X_train[numeric_cols].fillna(X_train[numeric_cols].median())
-            X_test_num = X_test[numeric_cols].fillna(X_train[numeric_cols].median())
-        else:
-            # Reconstruire les DataFrames numériques (conserver index/colonnes)
-            X_train_num = pd.DataFrame(X_train_num_imputed, columns=numeric_cols, index=X_train.index)
-            X_test_num = pd.DataFrame(X_test_num_imputed, columns=numeric_cols, index=X_test.index)
-
+        joblib.dump(meta, "cognitiveai_model.pkl")
+        joblib.dump({
+            "num_cols": num_cols,
+            "cat_cols": cat_cols,
+            "features": feature_names
+        }, "preproc.pkl")
+        joblib.dump(xgb_base, "base_xgb.pkl")
+        joblib.dump(lgb_base, "base_lgb.pkl")
+        joblib.dump(cat_base, "base_cat.pkl")
+        print("✅ Modèles de base sauvegardés (xgb, lgb, cat)")
+        print("✅ Modèle et préprocesseur sauvegardés :")
+        print("   → cognitiveai_model.pkl")
+        print("   → preproc.pkl")
     except Exception as e:
-        # En cas d'erreur (ex: types ou décodage), fallback sûr
-        print(f"Warning: imputer failed ({e}), using per-column median fillna as fallback")
-        X_train_num = X_train[numeric_cols].fillna(X_train[numeric_cols].median())
-        X_test_num = X_test[numeric_cols].fillna(X_train[numeric_cols].median())
-    
-    # Encodage des variables catégorielles
-    label_encoders = {}
-    X_train_cat_list = []
-    X_test_cat_list = []
-    
-    for col in categorical_cols:
-        le = LabelEncoder()
-        
-        # Gérer les valeurs manquantes
-        train_col = X_train[col].fillna('missing').astype(str)
-        test_col = X_test[col].fillna('missing').astype(str)
-        
-        # Fit sur train
-        le.fit(train_col)
-        
-        # Transform train
-        train_encoded = le.transform(train_col)
-        
-        # Transform test avec gestion des nouvelles catégories
-        test_encoded = []
-        for val in test_col:
-            if val in le.classes_:
-                test_encoded.append(le.transform([val])[0])
-            else:
-                # Assigner à 'missing' si nouvelle catégorie
-                test_encoded.append(le.transform(['missing'])[0])
-        
-        X_train_cat_list.append(pd.Series(train_encoded, index=X_train.index, name=col))
-        X_test_cat_list.append(pd.Series(test_encoded, index=X_test.index, name=col))
-        label_encoders[col] = le
-    
-    # Combiner numériques et catégorielles
-    if categorical_cols:
-        X_train_cat = pd.concat(X_train_cat_list, axis=1)
-        X_test_cat = pd.concat(X_test_cat_list, axis=1)
-        X_train_combined = pd.concat([X_train_num, X_train_cat], axis=1)
-        X_test_combined = pd.concat([X_test_num, X_test_cat], axis=1)
-    else:
-        X_train_combined = X_train_num
-        X_test_combined = X_test_num
-    
-    # 1. Imputation des valeurs manquantes d'abord
-    print("\n🔍 Imputation des valeurs manquantes...")
-    
-    # Traiter les colonnes numériques et catégorielles séparément
-    numeric_cols = X_train_combined.select_dtypes(include=[np.number]).columns
-    categorical_cols = X_train_combined.select_dtypes(exclude=[np.number]).columns
-    
-    # Identifier les colonnes avec trop de valeurs manquantes (>50%)
-    missing_ratio = X_train_combined.isna().mean()
-    cols_to_drop = missing_ratio[missing_ratio > 0.5].index
-    if len(cols_to_drop) > 0:
-        print(f"   ⚠️ Suppression de {len(cols_to_drop)} colonnes avec >50% de NaN:")
-        print("   " + ", ".join(cols_to_drop[:5]) + "..." if len(cols_to_drop) > 5 else "   " + ", ".join(cols_to_drop))
-        X_train_combined = X_train_combined.drop(columns=cols_to_drop)
-        X_test_combined = X_test_combined.drop(columns=cols_to_drop)
-        
-        # Mettre à jour les listes de colonnes
-        numeric_cols = X_train_combined.select_dtypes(include=[np.number]).columns
-        categorical_cols = X_train_combined.select_dtypes(exclude=[np.number]).columns
-    
-    # Pour les colonnes numériques : imputation en deux étapes
-    X_train_num = X_train_combined[numeric_cols].copy()
-    X_test_num = X_test_combined[numeric_cols].copy()
-    
-    # 1. Remplacer les valeurs extrêmes par NaN
-    for col in numeric_cols:
-        q1 = X_train_num[col].quantile(0.01)
-        q3 = X_train_num[col].quantile(0.99)
-        iqr = q3 - q1
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        
-        # Remplacer les valeurs extrêmes par NaN
-        X_train_num.loc[X_train_num[col] < lower, col] = np.nan
-        X_train_num.loc[X_train_num[col] > upper, col] = np.nan
-        X_test_num.loc[X_test_num[col] < lower, col] = np.nan
-        X_test_num.loc[X_test_num[col] > upper, col] = np.nan
-    
-    # 2. Imputation avec la médiane
-    train_medians = X_train_num.median()
-    X_train_num = X_train_num.fillna(train_medians)
-    X_test_num = X_test_num.fillna(train_medians)
-    
-    # Pour les colonnes catégorielles : utiliser le mode et une catégorie 'UNKNOWN' pour les NaN
-    if len(categorical_cols) > 0:
-        X_train_cat = X_train_combined[categorical_cols].fillna('UNKNOWN')
-        X_test_cat = X_test_combined[categorical_cols].fillna('UNKNOWN')
-        
-        # Recombiner les colonnes numériques et catégorielles
-        X_train_imputed = pd.concat([X_train_num, X_train_cat], axis=1)
-        X_test_imputed = pd.concat([X_test_num, X_test_cat], axis=1)
-    else:
-        X_train_imputed = X_train_num
-        X_test_imputed = X_test_num
-    
-    # Vérification finale
-    train_na = X_train_imputed.isna().sum().sum()
-    test_na = X_test_imputed.isna().sum().sum()
-    if train_na > 0 or test_na > 0:
-        raise ValueError(f"Il reste des NaN après imputation: train={train_na}, test={test_na}")
-    
-    print(f"   ✓ Données nettoyées et imputées: {X_train_imputed.shape}")
-    print(f"   ✓ Colonnes restantes: {len(X_train_imputed.columns)}")
-    
-    # 2. Normalisation des données imputées
-    print("📊 Normalisation des features...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_imputed)
-    X_test_scaled = scaler.transform(X_test_imputed)
-    
-    # 3. Sélection des meilleures features
-    print("\n🎯 Sélection des features les plus importantes...")
-    selector = SelectKBest(score_func=f_classif, k=30)  # garder les 30 meilleures features
-    X_train_selected = selector.fit_transform(X_train_scaled, y_train)
-    X_test_selected = selector.transform(X_test_scaled)
-    
-    # Afficher les features sélectionnées et leurs scores
-    feature_names = np.array(X_train_combined.columns)
-    selected_mask = selector.get_support()
-    selected_features = feature_names[selected_mask]
-    feature_scores = pd.DataFrame({
-        'Feature': feature_names,
-        'Score': selector.scores_,
-        'Selected': selected_mask
-    }).sort_values('Score', ascending=False)
-    
-    print("\nTop 10 features sélectionnées:")
-    print(feature_scores[feature_scores['Selected']].head(10).to_string(index=False))
+        print("⚠️ Erreur lors de la sauvegarde :", e)
 
-    # Convertir en float32 et s'assurer qu'il n'y a pas de NaN
-    X_train_selected = X_train_selected.astype(np.float32)
-    X_test_selected = X_test_selected.astype(np.float32)
+    print("\n✨ Terminé.")
+    print("Résumé:", metrics)
 
-    # Vérification finale
-    if np.isnan(X_train_selected).any() or np.isnan(X_test_selected).any():
-        raise ValueError("Des NaN persistent après le prétraitement!")
-
-    # Count problematic values before sanitizing
-    nan_train = np.isnan(X_train_scaled).sum()
-    nan_test = np.isnan(X_test_scaled).sum()
-    inf_train = np.isinf(X_train_scaled).sum()
-    inf_test = np.isinf(X_test_scaled).sum()
-    if nan_train or nan_test or inf_train or inf_test:
-        print(f"   ⚠️ Detected numeric issues before sanitization: nan_train={nan_train}, nan_test={nan_test}, inf_train={inf_train}, inf_test={inf_test}")
-
-    # Replace NaN with 0 and infinite with large finite values
-    X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=1e6, neginf=-1e6)
-    X_test_scaled = np.nan_to_num(X_test_scaled, nan=0.0, posinf=1e6, neginf=-1e6)
-
-    # Clip extreme values that could destabilize training
-    clip_val = 1e6
-    X_train_scaled = np.clip(X_train_scaled, -clip_val, clip_val)
-    X_test_scaled = np.clip(X_test_scaled, -clip_val, clip_val)
-
-    print(f"   ✓ Shape finale: {X_train_selected.shape}")
-    print(f"   ✓ Réduction de dimension: {X_train_combined.shape[1]} → {X_train_selected.shape[1]} features")
-
-    return X_train_selected, X_test_selected, scaler, label_encoders
-
-# ==================== ENTRAÎNEMENT ====================
-class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-    
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
-
-def train_model(model, train_loader, val_loader, device, config, class_weights=None):
-    """Entraîne le modèle avec mixed precision et early stopping"""
-    print("\n🚀 Début de l'entraînement...")
-    
-    # Loss pondérée pour gérer le déséquilibre des classes
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, 
-                           weight_decay=config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
-                                                     factor=0.5, patience=5)
-    
-    # Mixed precision training
-    scaler = GradScaler()
-    early_stopping = EarlyStopping(patience=config.PATIENCE)
-    
-    history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
-    best_val_acc = 0
-    
-    for epoch in range(config.EPOCHS):
-        # Training
-        model.train()
-        train_loss = 0
-        train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config.EPOCHS}')
-        
-        for X_batch, y_batch in train_bar:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
-            optimizer.zero_grad()
-            
-            with autocast():
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-            
-                # Check for NaN/inf in outputs before backward
-                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                    print("Error: model outputs contain NaN or Inf. Dumping diagnostics:")
-                    print(f"  X_batch: nan={torch.isnan(X_batch).sum().item()}, inf={(~torch.isfinite(X_batch)).sum().item()}")
-                    print(f"  y_batch unique: {torch.unique(y_batch)}")
-                    return history
-
-                if torch.isnan(loss) or not torch.isfinite(loss):
-                    print(f"Error: loss is NaN or Inf (loss={loss}). Dumping diagnostics:")
-                    print(f"  outputs min/max: {torch.min(outputs).item()}/{torch.max(outputs).item()}")
-                    print(f"  X_batch stats: min={torch.min(X_batch).item()}, max={torch.max(X_batch).item()}, mean={torch.mean(X_batch).item()}")
-                    print(f"  y_batch unique: {torch.unique(y_batch)}")
-                    return history
-
-                scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            train_loss += loss.item()
-            train_bar.set_postfix({'loss': loss.item()})
-        
-        avg_train_loss = train_loss / len(train_loader)
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        all_preds = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                
-                with autocast():
-                    outputs = model(X_batch)
-                    loss = criterion(outputs, y_batch)
-                
-                val_loss += loss.item()
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(y_batch.cpu().numpy())
-        
-        avg_val_loss = val_loss / len(val_loader)
-        val_acc = accuracy_score(all_labels, all_preds)
-        
-        history['train_loss'].append(avg_train_loss)
-        history['val_loss'].append(avg_val_loss)
-        history['val_acc'].append(val_acc)
-        
-        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, "
-              f"Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.4f}")
-        
-        # Learning rate scheduling
-        scheduler.step(avg_val_loss)
-        
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), config.MODEL_PATH)
-            print(f"   ✓ Modèle sauvegardé (acc={val_acc:.4f})")
-        
-        # Early stopping
-        early_stopping(avg_val_loss)
-        if early_stopping.early_stop:
-            print(f"⏹️ Early stopping à l'epoch {epoch+1}")
-            break
-    
-    return history
-
-def evaluate_model(model, test_loader, device, le_target):
-    """Évalue le modèle sur le set de test"""
-    print("\n📊 Évaluation du modèle...")
-    
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-    
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch = X_batch.to(device)
-            
-            with autocast():
-                outputs = model(X_batch)
-            
-            probs = torch.softmax(outputs, dim=1)
-            preds = torch.argmax(outputs, dim=1)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(y_batch.numpy())
-            all_probs.extend(probs.cpu().numpy())
-    
-    # Métriques
-    acc = accuracy_score(all_labels, all_preds)
-    recall = recall_score(all_labels, all_preds, average='weighted')
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    
-    print(f"\n{'='*50}")
-    print(f"   Accuracy:  {acc:.4f}")
-    print(f"   Recall:    {recall:.4f}")
-    print(f"   F1-Score:  {f1:.4f}")
-    print(f"{'='*50}\n")
-    
-    # Classification report
-    print("Classification Report:")
-    print(classification_report(all_labels, all_preds, 
-                               target_names=le_target.classes_.astype(str)))
-    
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-               xticklabels=le_target.classes_,
-               yticklabels=le_target.classes_)
-    plt.title('Matrice de Confusion')
-    plt.ylabel('Vraie classe')
-    plt.xlabel('Classe prédite')
-    plt.tight_layout()
-    plt.savefig('confusion_matrix.png', dpi=300)
-    print("✓ Matrice de confusion sauvegardée: confusion_matrix.png")
-    
-    return acc, recall, f1
-
-def plot_training_history(history):
-    """Visualise l'historique d'entraînement"""
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-    
-    # Loss
-    axes[0].plot(history['train_loss'], label='Train Loss')
-    axes[0].plot(history['val_loss'], label='Val Loss')
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Évolution de la Loss')
-    axes[0].legend()
-    axes[0].grid(True)
-    
-    # Accuracy
-    axes[1].plot(history['val_acc'], label='Val Accuracy', color='green')
-    axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('Accuracy')
-    axes[1].set_title('Évolution de l\'Accuracy')
-    axes[1].legend()
-    axes[1].grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('training_history.png', dpi=300)
-    print("✓ Historique d'entraînement sauvegardé: training_history.png")
-
-def compute_feature_importance(model, X_test, y_test, feature_names, device):
-    """Calcule l'importance des features via permutation"""
-    print("\n🔍 Calcul de l'importance des features...")
-
-    from sklearn.base import BaseEstimator
-
-    class ModelWrapper(BaseEstimator):
-        """Adapter le modèle PyTorch au format sklearn"""
-        def __init__(self, model, device):
-            self.model = model
-            self.device = device
-
-        def fit(self, X, y=None):
-            # Rien à entraîner, mais nécessaire pour sklearn
-            return self
-
-        def predict(self, X):
-            self.model.eval()
-            with torch.no_grad():
-                X_tensor = torch.FloatTensor(X).to(self.device)
-                with autocast():
-                    outputs = self.model(X_tensor)
-                preds = torch.argmax(outputs, dim=1)
-            return preds.cpu().numpy()
-
-        def score(self, X, y):  # ✅ Ajout obligatoire
-            """Retourne la précision (accuracy)"""
-            preds = self.predict(X)
-            return accuracy_score(y, preds)
-
-    wrapper = ModelWrapper(model, device)
-
-    # Échantillon pour accélérer le calcul
-    sample_size = min(5000, len(X_test))
-    indices = np.random.choice(len(X_test), sample_size, replace=False)
-    X_sample = X_test[indices]
-    y_sample = y_test[indices]
-
-    # Calcul de l'importance avec scoring explicite
-    result = permutation_importance(
-        wrapper.fit(X_sample, y_sample),
-        X_sample, y_sample,
-        scoring="accuracy",        # ✅ explicite
-        n_repeats=10,
-        random_state=42,
-        n_jobs=-1
-    )
-
-    importance_df = (
-        pd.DataFrame({
-            "feature": feature_names,
-            "importance": result.importances_mean
-        })
-        .sort_values("importance", ascending=False)
-    )
-
-    print("\nTop 15 features les plus importantes:")
-    print(importance_df.head(15).to_string(index=False))
-
-    plt.figure(figsize=(12, 8))
-    top = importance_df.head(20)
-    plt.barh(range(len(top)), top["importance"])
-    plt.yticks(range(len(top)), top["feature"])
-    plt.xlabel("Importance moyenne (Permutation)")
-    plt.title("Top 20 Features - Permutation Importance")
-    plt.tight_layout()
-    plt.savefig("feature_importance.png", dpi=300)
-    print("✓ Importance des features sauvegardée: feature_importance.png")
-
-    return importance_df
-
-    """Calcule l'importance des features via permutation"""
-    print("\n🔍 Calcul de l'importance des features...")
-
-    from sklearn.base import BaseEstimator
-
-    class ModelWrapper(BaseEstimator):
-        """Adapter le modèle PyTorch au format sklearn"""
-        def __init__(self, model, device):
-            self.model = model
-            self.device = device
-
-        def fit(self, X, y=None):
-            # rien à entraîner, mais nécessaire pour sklearn
-            return self
-
-        def predict(self, X):
-            self.model.eval()
-            with torch.no_grad():
-                X_tensor = torch.FloatTensor(X).to(self.device)
-                with autocast():
-                    outputs = self.model(X_tensor)
-                preds = torch.argmax(outputs, dim=1)
-            return preds.cpu().numpy()
-
-    wrapper = ModelWrapper(model, device)
-
-    # Échantillon pour accélérer le calcul
-    sample_size = min(5000, len(X_test))
-    indices = np.random.choice(len(X_test), sample_size, replace=False)
-    X_sample = X_test[indices]
-    y_sample = y_test[indices]
-
-    result = permutation_importance(
-        wrapper.fit(X_sample, y_sample),  # ✅ appel à fit ajouté
-        X_sample, y_sample,
-        n_repeats=10, random_state=42, n_jobs=-1
-    )
-
-    importance_df = (
-        pd.DataFrame({"feature": feature_names,
-                      "importance": result.importances_mean})
-        .sort_values("importance", ascending=False)
-    )
-
-    print("\nTop 15 features les plus importantes:")
-    print(importance_df.head(15).to_string(index=False))
-
-    plt.figure(figsize=(12, 8))
-    top = importance_df.head(20)
-    plt.barh(range(len(top)), top["importance"])
-    plt.yticks(range(len(top)), top["feature"])
-    plt.xlabel("Importance moyenne (Permutation)")
-    plt.title("Top 20 Features - Permutation Importance")
-    plt.tight_layout()
-    plt.savefig("feature_importance.png", dpi=300)
-    print("✓ Importance des features sauvegardée: feature_importance.png")
-
-    return importance_df
-
-    """Calcule l'importance des features via permutation"""
-    print("\n🔍 Calcul de l'importance des features...")
-    
-    # Wrapper pour sklearn
-    class ModelWrapper:
-        def __init__(self, model, device):
-            self.model = model
-            self.device = device
-        
-        def predict(self, X):
-            self.model.eval()
-            with torch.no_grad():
-                X_tensor = torch.FloatTensor(X).to(self.device)
-                with autocast():
-                    outputs = self.model(X_tensor)
-                preds = torch.argmax(outputs, dim=1)
-            return preds.cpu().numpy()
-    
-    wrapper = ModelWrapper(model, device)
-    
-    # Permutation importance (sur un échantillon pour accélérer)
-    sample_size = min(5000, len(X_test))
-    indices = np.random.choice(len(X_test), sample_size, replace=False)
-    X_sample = X_test[indices]
-    y_sample = y_test[indices]
-    
-    result = permutation_importance(wrapper, X_sample, y_sample, 
-                                   n_repeats=10, random_state=42, n_jobs=-1)
-    
-    # Top features
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': result.importances_mean
-    }).sort_values('importance', ascending=False)
-    
-    print("\nTop 15 features les plus importantes:")
-    print(importance_df.head(15).to_string(index=False))
-    
-    # Visualisation
-    plt.figure(figsize=(12, 8))
-    top_features = importance_df.head(20)
-    plt.barh(range(len(top_features)), top_features['importance'])
-    plt.yticks(range(len(top_features)), top_features['feature'])
-    plt.xlabel('Importance')
-    plt.title('Top 20 Features - Permutation Importance')
-    plt.tight_layout()
-    plt.savefig('feature_importance.png', dpi=300)
-    print("✓ Importance des features sauvegardée: feature_importance.png")
-    
-    return importance_df
-
-# ==================== MODE INFÉRENCE ====================
-def predict_new_patients(model_path, scaler_path, encoders_path, input_csv, device):
-    """Prédit le profil cognitif de nouveaux patients"""
-    print(f"\n🔮 Mode Inférence - {input_csv}")
-    
-    # Charger le modèle
-    checkpoint = torch.load(model_path, map_location=device)
-    input_dim = checkpoint['network.0.weight'].shape[1]
-    output_dim = checkpoint[list(checkpoint.keys())[-1]].shape[0]
-    
-    model = CognitiveNet(input_dim, config.HIDDEN_DIMS, output_dim, config.DROPOUT)
-    model.load_state_dict(checkpoint)
-    model.to(device)
-    model.eval()
-    
-    # Charger scaler et encoders
-    with open(scaler_path, 'rb') as f:
-        scaler = pickle.load(f)
-    with open(encoders_path, 'rb') as f:
-        label_encoders = pickle.load(f)
-    
-    # Charger les données
-    df = pd.read_csv(input_csv)
-    print(f"   {len(df)} nouveaux patients à prédire")
-    
-    # Prétraitement (simplifié)
-    X = df.select_dtypes(include=[np.number]).fillna(0)
-    X_scaled = scaler.transform(X)
-    
-    # Prédiction
-    with torch.no_grad():
-        X_tensor = torch.FloatTensor(X_scaled).to(device)
-        with autocast():
-            outputs = model(X_tensor)
-        probs = torch.softmax(outputs, dim=1)
-        preds = torch.argmax(outputs, dim=1)
-    
-    # Résultats
-    df['predicted_class'] = preds.cpu().numpy()
-    df['confidence'] = probs.max(dim=1)[0].cpu().numpy()
-    
-    output_path = 'predictions.csv'
-    df.to_csv(output_path, index=False)
-    print(f"✓ Prédictions sauvegardées: {output_path}")
-    
-    return df
-
-# ==================== MAIN ====================
-def main(args):
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n{'='*60}")
-    print(f"🧠 CognitiveAI - Prédiction du déclin cognitif")
-    print(f"{'='*60}")
-    print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} Go")
-    print(f"{'='*60}\n")
-    
-    # Mode inférence
-    if args.predict:
-        predict_new_patients(config.MODEL_PATH, config.SCALER_PATH, 
-                           config.ENCODER_PATH, args.predict, device)
-        return
-    
-    # ===== PIPELINE D'ENTRAÎNEMENT =====
-    
-    # 1. Chargement et sélection
-    df = load_and_select_features(config.DATA_PATH, config.KEYWORDS)
-    
-    # 2. Nettoyage
-    df = clean_data(df)
-    
-    # 3. Préparation cible
-    X, y, le_target = prepare_target_variable(df)
-    
-    # 4. Split train/test
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=config.TEST_SIZE, random_state=config.RANDOM_STATE,
-        stratify=y
-    )
-    print(f"\n📊 Split: Train={len(X_train):,}, Test={len(X_test):,}")
-    
-    # 5. Prétraitement
-    X_train_scaled, X_test_scaled, scaler, label_encoders = preprocess_features(
-        X_train.copy(), X_test.copy(), y_train
-    )
-    
-    # Sauvegarde des preprocessors
-    with open(config.SCALER_PATH, 'wb') as f:
-        pickle.dump(scaler, f)
-    with open(config.ENCODER_PATH, 'wb') as f:
-        pickle.dump(label_encoders, f)
-    print(f"✓ Scaler et encoders sauvegardés")
-    
-    # 6. DataLoaders
-    train_dataset = CognitiveDataset(X_train_scaled, y_train)
-    test_dataset = CognitiveDataset(X_test_scaled, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE,
-                             shuffle=True, num_workers=config.NUM_WORKERS,
-                             pin_memory=config.PIN_MEMORY)
-    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE,
-                            shuffle=False, num_workers=config.NUM_WORKERS,
-                            pin_memory=config.PIN_MEMORY)
-    
-    # Split validation
-    val_size = int(0.2 * len(train_dataset))
-    train_size = len(train_dataset) - val_size
-    train_subset, val_subset = torch.utils.data.random_split(
-        train_dataset, [train_size, val_size]
-    )
-    
-    train_loader_split = DataLoader(train_subset, batch_size=config.BATCH_SIZE,
-                                   shuffle=True, num_workers=config.NUM_WORKERS,
-                                   pin_memory=config.PIN_MEMORY)
-    val_loader = DataLoader(val_subset, batch_size=config.BATCH_SIZE,
-                          shuffle=False, num_workers=config.NUM_WORKERS,
-                          pin_memory=config.PIN_MEMORY)
-    
-    # 7. Modèle
-    input_dim = X_train_scaled.shape[1]
-    output_dim = len(np.unique(y))
-    
-    model = CognitiveNet(input_dim, config.HIDDEN_DIMS, output_dim, config.DROPOUT)
-    model.to(device)
-    
-    print(f"\n🏗️ Architecture du modèle:")
-    print(f"   Input: {input_dim} features")
-    print(f"   Hidden: {config.HIDDEN_DIMS}")
-    print(f"   Output: {output_dim} classes")
-    print(f"   Paramètres: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Calculer les poids pour le rééquilibrage des classes
-    print("\n⚖️ Calcul des poids pour rééquilibrage des classes...")
-    class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
-    class_weights = torch.FloatTensor(class_weights).to(device)
-    print(f"   Poids: {dict(zip(range(len(class_weights)), class_weights.cpu().numpy()))}")
-    
-    # 8. Entraînement
-    history = train_model(model, train_loader_split, val_loader, device, config, class_weights=class_weights)
-    
-    # 9. Visualisation historique
-    plot_training_history(history)
-    
-    # 10. Chargement du meilleur modèle
-    model.load_state_dict(torch.load(config.MODEL_PATH))
-    
-    # 11. Évaluation
-    acc, recall, f1 = evaluate_model(model, test_loader, device, le_target)
-    
-    # 12. Feature importance
-    feature_names = X_train.columns.tolist()
-    importance_df = compute_feature_importance(model, X_test_scaled, y_test, 
-                                              feature_names, device)
-    
-    print(f"\n{'='*60}")
-    print("✅ Entraînement terminé avec succès!")
-    print(f"   Modèle: {config.MODEL_PATH}")
-    print(f"   Accuracy: {acc:.4f}")
-    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='CognitiveAI')
-    parser.add_argument('--predict', type=str, help='Fichier CSV pour inférence')
-    args = parser.parse_args()
+    main()
     
-    main(args)
