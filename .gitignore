@@ -1,0 +1,14 @@
+# Ignore comma-separated values data files (do not push datasets to the repo)
+*.csv
+
+# Common extras (optional but useful)
+*.pth
+*.joblib
+__pycache__/
+*.pyc
+.vscode/
+.env
+.DS_Store
+
+# Keep the gitignore file tracked
+!.gitignore
